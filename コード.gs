@@ -28,42 +28,43 @@ function showExecutionDialogs() {
 
 // メイン処理
 function main() {
-  try {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet(); // スプレッドシートの参照を一度取得
+  try {  
     // 設定値取得
-    const { invoiceFolderName, promptNotes } = getSettingData();
+    const { invoiceFolderName, promptNotes } = getSettingData(spreadsheet);
     // 処理ステータス表示
-    displayStatus('処理対象PDF数を取得しています。');
+    displayStatus(spreadsheet, '処理対象PDF数を取得しています。');
 
     // 処理対象取得
     const pdfFiles = getPDFFilesInFolder(invoiceFolderName + '/未処理');
-    displayStatus(`処理対象PDF数を取得しました。処理対象の件数は ”${pdfFiles.length}" 件です。`);
+    displayStatus(spreadsheet, `処理対象PDF数を取得しました。処理対象の件数は ${pdfFiles.length} 件です。`);
 
     // API呼び出し＆スプレッドシート書き込み＆フォルダ移動
-    const { successCount, errorCount } = processPDFFiles(pdfFiles, promptNotes, invoiceFolderName + '/処理済');
-    displayStatus(`処理完了しました。正常件数: ${successCount} 件, エラー件数: ${errorCount} 件`);
+    const { successCount, errorCount } = processPDFFiles(spreadsheet, pdfFiles, promptNotes, invoiceFolderName + '/処理済');
+    displayStatus(spreadsheet, `処理完了しました。正常件数: ${successCount} 件, エラー件数: ${errorCount} 件`);
   } catch (error) {
     Logger.log(`メイン処理中にエラーが発生しました: ${error}`);
-    displayStatus("main() 処理中にエラーが発生しました。", error);
+    displayStatus(spreadsheet, "main() 処理中にエラーが発生しました。", error);
   }
 }
 
 // ステータス表示
-function displayStatus(message, error=null) {
+function displayStatus(spreadsheet, message, error = null) {
   // 今日の日付を表示
   var date = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss - ');
 
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME_LIST);
+  const sheet = spreadsheet.getSheetByName(SHEET_NAME_LIST);
   if (!error) {
     sheet.getRange(1, 3).setValue(date + message);
   } else {
-    sheet.getRange(2, 3).setValue(date + message + `error=”${error}"`);
+    sheet.getRange(2, 3).setValue(date + message + `”${error}"`);
   }
   SpreadsheetApp.flush();
 }
 
 // 設定データ取得
-function getSettingData() {
-  const settingsSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME_SETTINGS);
+function getSettingData(spreadsheet) {
+  const settingsSheet = spreadsheet.getSheetByName(SHEET_NAME_SETTINGS);
   const invoiceFolderName = settingsSheet.getRange('C2').getValue();
   const promptNotes = settingsSheet.getRange('C3').getValue();
   return { invoiceFolderName, promptNotes };
@@ -75,7 +76,8 @@ function getPDFFilesInFolder(folderName) {
 
   if (!folder) {
     Logger.log(`フォルダ "${folderName}" が見つかりません。`);
-    return [];
+    throw new Error(`フォルダ "${folderName}" が見つかりません。`);
+    // return [];
   }
 
   return getPDFFilesSortedByName(folder);
@@ -98,41 +100,63 @@ function getPDFFilesSortedByName(folder) {
 }
 
 // PDFファイル処理
-function processPDFFiles(pdfFiles, promptNotes, destFolderName) {
+function processPDFFiles(spreadsheet, pdfFiles, promptNotes, destFolderName) {
   let successCount = 0; // 正常件数
   let errorCount = 0;   // エラー件数
+  const dataToWrite = []; // 書き込むデータを蓄積する二次元配列
+  const filesToMove = []; // 移動するファイルを蓄積する配列
 
   try {
     // スプレッドシートの書き込み済の最終行を取得
-    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME_LIST);
+    const sheet = spreadsheet.getSheetByName(SHEET_NAME_LIST);
     const lastRow = sheet.getRange(sheet.getMaxRows(), 6).getNextDataCell(SpreadsheetApp.Direction.UP).getRow();
 
     // 処理済フォルダの取得
     const destFolder = getFolderByPath(destFolderName);
     if (!destFolder) {
       Logger.log(`フォルダ "${destFolderName}" が見つかりません。`);
-      return { successCount, errorCount };
+      throw new Error(`フォルダ "${destFolderName}" が見つかりません。`);
+      // return { successCount, errorCount };
     }
 
     pdfFiles.forEach((pdfFile, index) => {
-      displayStatus(`"${pdfFile.getName()}" を処理中（${index + 1}/${pdfFiles.length}件目）です。`);
+      displayStatus(spreadsheet, `"${pdfFile.getName()}" を処理中です。（ ${index + 1} / ${pdfFiles.length} 件目）`);
       logFileDetails(pdfFile, index + 1);
       Utilities.sleep(SLEEP_DURATION); // スリープを入れることでAPIのレート制限を回避
 
       const invoiceData = extractInvoiceDataFromPDF(pdfFile.getId(), promptNotes);
       if (invoiceData) {
         logInvoiceData(invoiceData);
-        writeDataToSheet(lastRow + index + 1, pdfFile, invoiceData);
-        pdfFile.moveTo(destFolder);
+        // データを二次元配列に追加
+        dataToWrite.push([
+          invoiceData.date,
+          invoiceData.issuer,
+          invoiceData.amount,
+          "", // 空のセル
+          "", // 空のセル
+          pdfFile.getUrl(),
+          pdfFile.getName()
+        ]);
+        filesToMove.push(pdfFile); // 移動するファイルを配列に追加
         successCount++; // 正常件数をカウント
       } else {
         Logger.log('請求書データを取得できませんでした。');
         errorCount++; // エラー件数をカウント
       }
     });
+
+    // すべてのデータを一括で書き込む
+    if (dataToWrite.length > 0) {
+      writeDataToSheet(spreadsheet, lastRow + 1, dataToWrite);
+
+      // データの書き込みが成功した後にファイルを移動
+      filesToMove.forEach((pdfFile) => {
+        pdfFile.moveTo(destFolder);
+      });
+    }
   } catch (error) {
     Logger.log(`PDFファイル処理中にエラーが発生しました: ${error}`);
-    displayStatus("processPDFFiles() 処理中にエラーが発生しました。", error);
+    displayStatus(spreadsheet, "processPDFFiles() 処理中にエラーが発生しました。", error);
   }
 
   return { successCount, errorCount }; // 正常件数とエラー件数を返す
@@ -162,19 +186,16 @@ function extractInvoiceDataFromPDF(fileId, notes) {
     return data.invoice_data;
   } catch (error) {
     Logger.log(`エラーが発生しました: ${error}`);
-    displayStatus("extractInvoiceDataFromPDF() 処理中にエラーが発生しました。", error);
     return null;
   }
 }
 
-// スプレッドシートにデータ書き込み
-function writeDataToSheet(row, pdfFile, invoiceData) {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME_LIST);
-  sheet.getRange(row, 1).setValue(invoiceData.date);
-  sheet.getRange(row, 2).setValue(invoiceData.issuer);
-  sheet.getRange(row, 3).setValue(invoiceData.amount);
-  sheet.getRange(row, 6).setValue(pdfFile.getUrl());
-  sheet.getRange(row, 7).setValue(pdfFile.getName());
+// スプレッドシートにデータを一括書き込み
+function writeDataToSheet(spreadsheet, startRow, data) {
+  const sheet = spreadsheet.getSheetByName(SHEET_NAME_LIST);
+
+  // データを一括で書き込む
+  sheet.getRange(startRow, 1, data.length, data[0].length).setValues(data);
   SpreadsheetApp.flush();
 }
 
@@ -188,9 +209,9 @@ function logFileDetails(pdfFile, fileNumber) {
 
 // 請求書データログ
 function logInvoiceData(invoiceData) {
-  Logger.log(`日付: ${invoiceData.date}`);
-  Logger.log(`請求元: ${invoiceData.issuer}`);
-  Logger.log(`金額: ${invoiceData.amount}`);
+  Logger.log(`日付      : ${invoiceData.date}`);
+  Logger.log(`請求元    : ${invoiceData.issuer}`);
+  Logger.log(`金額      : ${invoiceData.amount}`);
 }
 
 // フォルダ有無チェック
