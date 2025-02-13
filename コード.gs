@@ -1,8 +1,6 @@
 // 定数定義
 const SHEET_NAME_LIST = '一覧表';
 const SHEET_NAME_SETTINGS = '設定値';
-const API_ENDPOINT = 'https://vercel-sandbox-git-main-katsu-yoshimus-projects.vercel.app/api/exctract_invoice/';
-const SLEEP_DURATION = 4000; // APIのレート制限を回避するためのスリープ時間（ミリ秒）
 
 // 実行ダイアログ、結果ダイアログ
 function showExecutionDialogs() {
@@ -31,16 +29,27 @@ function main() {
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet(); // スプレッドシートの参照を一度取得
   try {  
     // 設定値取得
-    const { invoiceFolderName, promptNotes } = getSettingData(spreadsheet);
+    const settings = getSettingData(spreadsheet);
+    const { invoiceFolderName, promptNotes, batchSize, sleepDuration, apiEndpoint, unprocessedFolderName, processedFolderName } = settings;
+    //Logger.log(settings);
+
     // 処理ステータス表示
     displayStatus(spreadsheet, '処理対象PDF数を取得しています。');
-
+    
     // 処理対象取得
-    const pdfFiles = getPDFFilesInFolder(invoiceFolderName + '/未処理');
+    const pdfFiles = getPDFFilesInFolder(`${invoiceFolderName}/${unprocessedFolderName}`);
     displayStatus(spreadsheet, `処理対象PDF数を取得しました。処理対象の件数は ${pdfFiles.length} 件です。`);
-
+    
     // API呼び出し＆スプレッドシート書き込み＆フォルダ移動
-    const { successCount, errorCount } = processPDFFiles(spreadsheet, pdfFiles, promptNotes, invoiceFolderName + '/処理済');
+    const { successCount, errorCount } = processPDFFiles(
+      spreadsheet,
+      pdfFiles,
+      promptNotes,
+      `${invoiceFolderName}/${processedFolderName}`,
+      batchSize,
+      sleepDuration,
+      apiEndpoint
+    );
     displayStatus(spreadsheet, `処理完了しました。正常件数: ${successCount} 件, エラー件数: ${errorCount} 件`);
   } catch (error) {
     Logger.log(`メイン処理中にエラーが発生しました: ${error}`);
@@ -65,9 +74,16 @@ function displayStatus(spreadsheet, message, error = null) {
 // 設定データ取得
 function getSettingData(spreadsheet) {
   const settingsSheet = spreadsheet.getSheetByName(SHEET_NAME_SETTINGS);
-  const invoiceFolderName = settingsSheet.getRange('C2').getValue();
-  const promptNotes = settingsSheet.getRange('C3').getValue();
-  return { invoiceFolderName, promptNotes };
+  const settings = {
+    invoiceFolderName: settingsSheet.getRange('C2').getValue(), // フォルダ名
+    promptNotes: settingsSheet.getRange('C3').getValue(), // プロンプトのメモ
+    batchSize: settingsSheet.getRange('C4').getValue(), // バッチサイズ
+    sleepDuration: settingsSheet.getRange('C5').getValue(), // スリープ時間
+    apiEndpoint: settingsSheet.getRange('C6').getValue(), // APIエンドポイント
+    unprocessedFolderName: settingsSheet.getRange('C7').getValue(), // 「未処理」フォルダ名
+    processedFolderName: settingsSheet.getRange('C8').getValue() // 「処理済」フォルダ名
+  };
+  return settings; // オブジェクトとして返す
 }
 
 // フォルダ内のPDFファイル取得
@@ -99,8 +115,8 @@ function getPDFFilesSortedByName(folder) {
   return pdfFiles;
 }
 
-// PDFファイル処理
-function processPDFFiles(spreadsheet, pdfFiles, promptNotes, destFolderName) {
+// PDFファイル処理（バッチサイズごとに分割）
+function processPDFFiles(spreadsheet, pdfFiles, promptNotes, destFolderName, batchSize, sleepDuration, apiEndpoint) {
   let successCount = 0; // 正常件数
   let errorCount = 0;   // エラー件数
   const dataToWrite = []; // 書き込むデータを蓄積する二次元配列
@@ -116,43 +132,51 @@ function processPDFFiles(spreadsheet, pdfFiles, promptNotes, destFolderName) {
     if (!destFolder) {
       Logger.log(`フォルダ "${destFolderName}" が見つかりません。`);
       throw new Error(`フォルダ "${destFolderName}" が見つかりません。`);
-      // return { successCount, errorCount };
     }
 
-    pdfFiles.forEach((pdfFile, index) => {
-      displayStatus(spreadsheet, `"${pdfFile.getName()}" を処理中です。（ ${index + 1} / ${pdfFiles.length} 件目）`);
-      logFileDetails(pdfFile, index + 1);
-      Utilities.sleep(SLEEP_DURATION); // スリープを入れることでAPIのレート制限を回避
+    // バッチサイズごとに処理するためのループ
+    for (let i = 0; i < pdfFiles.length; i += batchSize) {
+      const batchFiles = pdfFiles.slice(i, i + batchSize); // バッチサイズごとに取得
 
-      const invoiceData = extractInvoiceDataFromPDF(pdfFile.getId(), promptNotes);
-      if (invoiceData) {
-        logInvoiceData(invoiceData);
-        // データを二次元配列に追加
-        dataToWrite.push([
-          invoiceData.date,
-          invoiceData.issuer,
-          invoiceData.amount,
-          "", // 空のセル
-          "", // 空のセル
-          pdfFile.getUrl(),
-          pdfFile.getName()
-        ]);
-        filesToMove.push(pdfFile); // 移動するファイルを配列に追加
-        successCount++; // 正常件数をカウント
-      } else {
-        Logger.log('請求書データを取得できませんでした。');
-        errorCount++; // エラー件数をカウント
+      // バッチごとの処理
+      batchFiles.forEach((pdfFile, index) => {
+        const globalIndex = i + index + 1; // 全体のインデックス
+        displayStatus(spreadsheet, `"${pdfFile.getName()}" を処理中です。（ ${globalIndex} / ${pdfFiles.length} 件目）`);
+        logFileDetails(pdfFile, globalIndex);
+        Utilities.sleep(sleepDuration); // スリープを入れることでAPIのレート制限を回避
+
+        const invoiceData = extractInvoiceDataFromPDF(pdfFile.getId(), promptNotes, apiEndpoint);
+        if (invoiceData) {
+          logInvoiceData(invoiceData);
+          // データを二次元配列に追加
+          dataToWrite.push([
+            invoiceData.date,
+            invoiceData.issuer,
+            invoiceData.amount,
+            "", // 空のセル
+            "", // 空のセル
+            pdfFile.getUrl(),
+            pdfFile.getName()
+          ]);
+          filesToMove.push(pdfFile); // 移動するファイルを配列に追加
+          successCount++; // 正常件数をカウント
+        } else {
+          Logger.log('請求書データを取得できませんでした。');
+          errorCount++; // エラー件数をカウント
+        }
+      });
+
+      // バッチごとにスプレッドシートに書き込み
+      if (dataToWrite.length > 0) {
+        writeDataToSheet(spreadsheet, lastRow + i + 1, dataToWrite);
+        dataToWrite.length = 0; // データをクリア
       }
-    });
 
-    // すべてのデータを一括で書き込む
-    if (dataToWrite.length > 0) {
-      writeDataToSheet(spreadsheet, lastRow + 1, dataToWrite);
-
-      // データの書き込みが成功した後にファイルを移動
+      // バッチごとにファイルを移動
       filesToMove.forEach((pdfFile) => {
         pdfFile.moveTo(destFolder);
       });
+      filesToMove.length = 0; // 移動するファイルをクリア
     }
   } catch (error) {
     Logger.log(`PDFファイル処理中にエラーが発生しました: ${error}`);
@@ -163,7 +187,7 @@ function processPDFFiles(spreadsheet, pdfFiles, promptNotes, destFolderName) {
 }
 
 // PDFから請求書データを抽出
-function extractInvoiceDataFromPDF(fileId, notes) {
+function extractInvoiceDataFromPDF(fileId, notes, apiEndpoint) {
   try {
     const file = DriveApp.getFileById(fileId);
     const fileBlob = file.getBlob();
@@ -180,12 +204,13 @@ function extractInvoiceDataFromPDF(fileId, notes) {
       // 'muteHttpExceptions': true
     };
 
-    const response = UrlFetchApp.fetch(API_ENDPOINT, options);
+    const response = UrlFetchApp.fetch(apiEndpoint, options);
     const data = JSON.parse(response.getContentText());
 
     return data.invoice_data;
   } catch (error) {
     Logger.log(`エラーが発生しました: ${error}`);
+    displayStatus(spreadsheet, "extractInvoiceDataFromPDF() 処理中にエラーが発生しました。", error);
     return null;
   }
 }
